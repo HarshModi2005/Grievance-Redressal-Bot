@@ -27,9 +27,40 @@ A comprehensive Telegram bot that processes images to extract complaint details,
 
 ## 🔧 Installation & Setup
 
+### Quick Start (Recommended)
+
+The easiest way to get started:
+
+**Linux/macOS:**
+```bash
+./quickstart.sh
+```
+
+**Windows:**
+```cmd
+quickstart.bat
+```
+
+The script will automatically:
+- Check Python and Tesseract installation
+- Create virtual environment
+- Install dependencies
+- Configure environment file
+- Run tests
+- Start the bot
+
+### Manual Setup
+
+For detailed step-by-step instructions, see **[SETUP.md](SETUP.md)** for comprehensive setup guide including:
+- Detailed installation instructions for all platforms
+- Configuration options
+- Testing procedures
+- Deployment options
+- Troubleshooting guide
+
 ### Prerequisites
 
-1. **Python 3.8+**
+1. **Python 3.9+** (3.8 minimum, 3.9+ recommended)
 2. **Tesseract OCR** installed on your system
 3. **Telegram Bot Token** from [@BotFather](https://t.me/botfather)
 4. **UMANG API Credentials** (optional - uses mock client if not available)

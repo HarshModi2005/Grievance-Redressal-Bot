@@ -89,6 +89,8 @@ class DatabaseManager:
                 session.add(user)
             
             session.commit()
+            # Detach from session to avoid lazy loading issues
+            session.expunge(user)
             self.logger.info(f"User {telegram_id} created/updated successfully")
             return user
         
@@ -118,6 +120,12 @@ class DatabaseManager:
             session.add(complaint)
             session.commit()
             
+            # Force loading of all attributes before detaching
+            complaint_id = complaint.id
+            
+            # Detach from session to avoid lazy loading issues
+            session.expunge(complaint)
+            
             self.logger.info(f"Complaint created for user {user_telegram_id}")
             return complaint
         
@@ -139,6 +147,8 @@ class DatabaseManager:
                         setattr(complaint, key, value)
                 
                 session.commit()
+                # Detach from session to avoid lazy loading issues
+                session.expunge(complaint)
                 self.logger.info(f"Complaint {complaint_id} updated successfully")
                 return complaint
             else:
@@ -203,6 +213,9 @@ class DatabaseManager:
             complaint_session = session.query(ComplaintSession).filter_by(
                 user_telegram_id=user_telegram_id
             ).first()
+            # Detach from session to avoid lazy loading issues
+            if complaint_session:
+                session.expunge(complaint_session)
             return complaint_session
         except Exception as e:
             self.logger.error(f"Error fetching session for user {user_telegram_id}: {e}")

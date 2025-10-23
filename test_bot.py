@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Import our modules
 from config import Config
-from database import db_manager
+from database import db_manager, User
 from ocr_processor import ocr_processor
 from location_detector import location_detector
 from complaint_classifier import complaint_classifier
@@ -107,7 +107,7 @@ class BotTester:
             # Refresh the user object to avoid session issues
             session = db_manager.get_session()
             try:
-                refreshed_user = session.query(db_manager.User).filter_by(telegram_id=12345).first()
+                refreshed_user = session.query(User).filter_by(telegram_id=12345).first()
                 assert refreshed_user.telegram_id == 12345
             finally:
                 session.close()
@@ -120,6 +120,8 @@ class BotTester:
             }
             
             test_complaint = db_manager.create_complaint(12345, complaint_data)
+            # Access attributes immediately before session closes
+            complaint_id = test_complaint.id
             assert test_complaint.user_telegram_id == 12345
             assert test_complaint.category == 'roads'
             

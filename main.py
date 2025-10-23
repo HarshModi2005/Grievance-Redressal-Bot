@@ -249,6 +249,7 @@ class GrievanceBotHandler:
     
     async def handle_image_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Handle image upload and processing"""
+        processing_msg = None
         try:
             user_id = update.effective_user.id
             
@@ -269,13 +270,36 @@ class GrievanceBotHandler:
             # Get the largest photo
             photo = update.message.photo[-1]
             
-            # Download image
-            photo_file = await photo.get_file()
-            image_path = os.path.join(self.temp_dir, f"{user_id}_{datetime.now().timestamp()}.jpg")
-            await photo_file.download_to_drive(image_path)
+            # Download image with timeout
+            try:
+                photo_file = await photo.get_file()
+                image_path = os.path.join(self.temp_dir, f"{user_id}_{datetime.now().timestamp()}.jpg")
+                await photo_file.download_to_drive(image_path)
+            except Exception as download_error:
+                self.logger.error(f"Error downloading image: {download_error}")
+                if processing_msg:
+                    await processing_msg.delete()
+                await update.message.reply_text(
+                    "❌ Error downloading image. Please try again."
+                )
+                return WAITING_FOR_IMAGE
             
             # Process image with OCR
             ocr_result = ocr_processor.extract_text_from_image(image_path)
+            
+            # Check if OCR was successful
+            if not ocr_result.get('extraction_success') and not ocr_result.get('cleaned_text'):
+                self.logger.warning(f"OCR failed or no text found in image for user {user_id}")
+                if processing_msg:
+                    await processing_msg.delete()
+                await update.message.reply_text(
+                    "⚠️ Could not extract readable text from the image.\n\n"
+                    "You can:\n"
+                    "• Try with a clearer, well-lit photo\n"
+                    "• Use Manual Complaint Entry to type your complaint\n"
+                    "• Continue anyway (less accurate classification)"
+                )
+                # Continue processing even with poor OCR
             
             # Extract GPS coordinates
             gps_coords = ocr_processor.extract_gps_from_image(image_path)
@@ -305,20 +329,33 @@ class GrievanceBotHandler:
                 'step': 'image_processed'
             }
             
-            db_manager.create_or_update_session(
-                user_id, 
-                json.dumps(session_data, default=str), 
-                'image_processed'
-            )
+            try:
+                db_manager.create_or_update_session(
+                    user_id, 
+                    json.dumps(session_data, default=str), 
+                    'image_processed'
+                )
+            except Exception as db_error:
+                self.logger.error(f"Error saving session: {db_error}")
+                # Continue anyway, data is in memory
             
             # Delete processing message
-            await processing_msg.delete()
+            if processing_msg:
+                try:
+                    await processing_msg.delete()
+                except:
+                    pass  # Message might be too old to delete
             
             # Show results
             return await self.show_image_analysis_results(update, context, session_data)
             
         except Exception as e:
-            self.logger.error(f"Error processing image: {e}")
+            self.logger.error(f"Error processing image: {e}", exc_info=True)
+            if processing_msg:
+                try:
+                    await processing_msg.delete()
+                except:
+                    pass
             await update.message.reply_text(
                 "❌ Error processing image. Please try again with a different photo."
             )
@@ -512,11 +549,18 @@ class GrievanceBotHandler:
                 await query.edit_message_text("❌ Session expired. Please start again.")
                 return MAIN_MENU
             
-            session_data = json.loads(session.session_data)
+            try:
+                session_data = json.loads(session.session_data)
+            except json.JSONDecodeError as json_err:
+                self.logger.error(f"Error parsing session data: {json_err}")
+                await query.edit_message_text("❌ Session data corrupted. Please start again.")
+                db_manager.clear_session(user_id)
+                return MAIN_MENU
+            
             formatted_complaint = session_data.get('formatted_complaint')
             
             if not formatted_complaint:
-                await query.edit_message_text("❌ No complaint data found.")
+                await query.edit_message_text("❌ No complaint data found. Please start again.")
                 return MAIN_MENU
             
             # Show submission progress
@@ -525,37 +569,65 @@ class GrievanceBotHandler:
                 "Please wait..."
             )
             
-            # Submit to UMANG/CPGRAMS
-            submission_result = umang_client.submit_grievance(formatted_complaint)
+            # Submit to UMANG/CPGRAMS with retry logic
+            max_retries = 3
+            submission_result = None
             
-            if submission_result['success']:
+            for attempt in range(max_retries):
+                try:
+                    submission_result = umang_client.submit_grievance(formatted_complaint)
+                    break
+                except Exception as api_error:
+                    self.logger.warning(f"Submission attempt {attempt + 1} failed: {api_error}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)  # Wait before retry
+                    else:
+                        submission_result = {
+                            'success': False,
+                            'error': 'API temporarily unavailable. Please try again later.'
+                        }
+            
+            if submission_result and submission_result['success']:
                 # Save complaint to database
-                complaint_data = {
-                    'complaint_text': session_data['ocr_result'].get('cleaned_text', ''),
-                    'extracted_text': session_data['ocr_result'].get('cleaned_text', ''),
-                    'category': formatted_complaint['category'],
-                    'location_address': session_data['location_info'].get('final_address'),
-                    'image_path': session_data.get('image_path'),
-                    'umang_reference_id': submission_result['reference_id'],
-                    'status': 'submitted'
-                }
-                
-                # Add coordinates if available
-                coords = session_data['location_info'].get('final_coordinates')
-                if coords:
-                    complaint_data['location_latitude'] = coords[0]
-                    complaint_data['location_longitude'] = coords[1]
-                
-                complaint = db_manager.create_complaint(user_id, complaint_data)
-                db_manager.update_complaint(complaint.id, {'submitted_at': datetime.now()})
+                try:
+                    # Get complaint text from appropriate source
+                    complaint_text = ''
+                    if 'ocr_result' in session_data:
+                        complaint_text = session_data['ocr_result'].get('cleaned_text', '')
+                    elif 'complaint_text' in session_data:
+                        complaint_text = session_data['complaint_text']
+                    
+                    complaint_data = {
+                        'complaint_text': complaint_text,
+                        'extracted_text': complaint_text,
+                        'category': formatted_complaint['category'],
+                        'location_address': session_data.get('location_info', {}).get('final_address'),
+                        'image_path': session_data.get('image_path'),
+                        'umang_reference_id': submission_result['reference_id'],
+                        'status': 'submitted'
+                    }
+                    
+                    # Add coordinates if available
+                    location_info = session_data.get('location_info', {})
+                    coords = location_info.get('final_coordinates')
+                    if coords:
+                        complaint_data['location_latitude'] = coords[0]
+                        complaint_data['location_longitude'] = coords[1]
+                    
+                    complaint = db_manager.create_complaint(user_id, complaint_data)
+                    db_manager.update_complaint(complaint.id, {'submitted_at': datetime.now()})
+                    
+                except Exception as db_error:
+                    self.logger.error(f"Error saving complaint to database: {db_error}")
+                    # Continue anyway - complaint was submitted to UMANG
                 
                 # Success message
                 success_message = (
                     "✅ *Complaint Submitted Successfully!*\n\n"
                     f"📋 *Reference ID:* `{submission_result['reference_id']}`\n"
-                    f"🎯 *Tracking Number:* `{submission_result['tracking_number']}`\n"
-                    f"🏢 *Department:* {submission_result['assigned_department']}\n"
-                    f"⏰ *Expected Resolution:* {submission_result['expected_resolution_days']} days\n\n"
+                    f"🎯 *Tracking Number:* `{submission_result.get('tracking_number', 'N/A')}`\n"
+                    f"🏢 *Department:* {submission_result.get('assigned_department', 'N/A')}\n"
+                    f"⏰ *Expected Resolution:* {submission_result.get('expected_resolution_days', 30)} days\n\n"
                     "💾 Save the Reference ID to track your complaint status.\n\n"
                     "Use the 'Track Complaint' option in the main menu to check progress."
                 )
@@ -574,25 +646,36 @@ class GrievanceBotHandler:
                 )
                 
             else:
+                error_msg = submission_result.get('error', 'Unknown error') if submission_result else 'Submission failed'
                 error_message = (
                     "❌ *Complaint Submission Failed*\n\n"
-                    f"Error: {submission_result.get('error', 'Unknown error')}\n\n"
-                    "Please try again or contact support."
+                    f"Error: {error_msg}\n\n"
+                    "Please try again. Your complaint data is saved and you can retry."
                 )
                 
                 await query.edit_message_text(
                     error_message,
                     parse_mode=ParseMode.MARKDOWN
                 )
+                # Don't clear session so user can retry
+                return MAIN_MENU
             
-            # Clear session
-            db_manager.clear_session(user_id)
+            # Clear session only on success
+            try:
+                db_manager.clear_session(user_id)
+            except Exception as clear_error:
+                self.logger.error(f"Error clearing session: {clear_error}")
             
             return MAIN_MENU
             
         except Exception as e:
-            self.logger.error(f"Error in confirm_submission: {e}")
-            await query.edit_message_text("❌ Error submitting complaint.")
+            self.logger.error(f"Error in confirm_submission: {e}", exc_info=True)
+            try:
+                await query.edit_message_text(
+                    "❌ Error submitting complaint. Please try again or contact support."
+                )
+            except:
+                pass
             return MAIN_MENU
     
     async def start_tracking(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -729,7 +812,7 @@ class GrievanceBotHandler:
             text = update.message.text
             user_id = update.effective_user.id
             
-            if text == "❌ Cancel":
+            if text == "❌ Cancel" or text == "❌ Cancel Edit":
                 return await self.cancel_command(update, context)
             
             if len(text) < 20:
@@ -737,6 +820,15 @@ class GrievanceBotHandler:
                     "Please provide more details about your complaint (at least 20 characters)."
                 )
                 return MANUAL_COMPLAINT_INPUT
+            
+            # Check if we're in edit mode
+            session = db_manager.get_session_data(user_id)
+            is_edit_mode = False
+            existing_session_data = {}
+            
+            if session:
+                existing_session_data = json.loads(session.session_data)
+                is_edit_mode = existing_session_data.get('edit_mode', False)
             
             # Process manual complaint
             processing_msg = await update.message.reply_text(
@@ -751,10 +843,23 @@ class GrievanceBotHandler:
             # Classify complaint
             classification = complaint_classifier.classify_complaint(text)
             
-            # Combine location methods (no GPS, no manual address yet)
-            location_info = location_detector.combine_location_methods(
-                None, text_location
-            )
+            # If in edit mode, preserve existing location if it was better
+            if is_edit_mode and existing_session_data.get('location_info', {}).get('final_address'):
+                # Use existing location if it was manually provided or GPS-based
+                old_location = existing_session_data.get('location_info', {})
+                if old_location.get('method_used') in ['gps', 'manual', 'user_gps']:
+                    location_info = old_location
+                else:
+                    # Recombine with new text location
+                    location_info = location_detector.combine_location_methods(
+                        existing_session_data.get('gps_coords'),
+                        text_location
+                    )
+            else:
+                # Combine location methods (no GPS, no manual address yet for new complaints)
+                location_info = location_detector.combine_location_methods(
+                    None, text_location
+                )
             
             # Store session data
             session_data = {
@@ -762,8 +867,14 @@ class GrievanceBotHandler:
                 'text_location': text_location,
                 'classification': classification,
                 'location_info': location_info,
-                'step': 'manual_processed'
+                'step': 'manual_processed',
+                'edit_mode': False  # Clear edit mode
             }
+            
+            # Preserve image path if it exists (for edited image-based complaints)
+            if is_edit_mode and 'image_path' in existing_session_data:
+                session_data['image_path'] = existing_session_data['image_path']
+                session_data['ocr_result'] = {'cleaned_text': text}
             
             db_manager.create_or_update_session(
                 user_id,
@@ -843,6 +954,318 @@ class GrievanceBotHandler:
             self.logger.error(f"Error showing manual analysis results: {e}")
             await update.message.reply_text("❌ Error displaying results.")
             return MAIN_MENU
+    
+    async def request_location_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Request manual location input from user"""
+        try:
+            query = update.callback_query
+            await query.answer()
+            
+            location_prompts = location_detector.get_manual_location_prompts()
+            
+            keyboard = [
+                [KeyboardButton("📍 Share Current Location", request_location=True)],
+                [KeyboardButton("⏭️ Skip Location")],
+                [KeyboardButton("❌ Cancel")]
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+            
+            await query.edit_message_text(
+                location_prompts['address_prompt'],
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="You can also share your current location using the button below:",
+                reply_markup=reply_markup
+            )
+            
+            return LOCATION_INPUT
+            
+        except Exception as e:
+            self.logger.error(f"Error requesting location input: {e}")
+            await query.edit_message_text("❌ Error requesting location.")
+            return MAIN_MENU
+    
+    async def handle_location_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle manual location input (text or GPS)"""
+        try:
+            user_id = update.effective_user.id
+            
+            # Get session data
+            session = db_manager.get_session_data(user_id)
+            if not session:
+                await update.message.reply_text("❌ Session expired. Please start again.")
+                return MAIN_MENU
+            
+            session_data = json.loads(session.session_data)
+            
+            # Handle text input
+            if update.message.text:
+                text = update.message.text
+                
+                if text == "❌ Cancel":
+                    return await self.cancel_command(update, context)
+                elif text == "⏭️ Skip Location":
+                    # Proceed without location
+                    await update.message.reply_text(
+                        "⏭️ Location skipped. Please include location details in your complaint description."
+                    )
+                    # Go back to review with existing data
+                    return await self.show_image_analysis_results(update, context, session_data)
+                else:
+                    # Process manual address
+                    manual_address = text
+                    
+                    # Try to geocode the address
+                    processing_msg = await update.message.reply_text("🔍 Validating location...")
+                    
+                    location_info = location_detector.combine_location_methods(
+                        session_data.get('gps_coords'),
+                        session_data.get('text_location', {}),
+                        manual_address
+                    )
+                    
+                    await processing_msg.delete()
+                    
+                    # Update session data with new location
+                    session_data['location_info'] = location_info
+                    db_manager.create_or_update_session(
+                        user_id,
+                        json.dumps(session_data, default=str),
+                        'location_updated'
+                    )
+                    
+                    # Show updated results
+                    if 'ocr_result' in session_data:
+                        return await self.show_image_analysis_results(update, context, session_data)
+                    else:
+                        return await self.show_manual_analysis_results(update, context, session_data)
+            
+            # Handle location share (GPS coordinates)
+            elif update.message.location:
+                location = update.message.location
+                gps_coords = (location.latitude, location.longitude)
+                
+                processing_msg = await update.message.reply_text("📍 Processing location...")
+                
+                # Validate and reverse geocode
+                validation = location_detector.validate_coordinates(location.latitude, location.longitude)
+                
+                location_info = {
+                    'final_coordinates': gps_coords,
+                    'final_address': validation.get('estimated_location', f"GPS: {location.latitude:.6f}, {location.longitude:.6f}"),
+                    'confidence': validation.get('accuracy', 'medium'),
+                    'sources': ['user_shared_location'],
+                    'method_used': 'user_gps'
+                }
+                
+                await processing_msg.delete()
+                
+                # Update session data
+                session_data['gps_coords'] = gps_coords
+                session_data['location_info'] = location_info
+                db_manager.create_or_update_session(
+                    user_id,
+                    json.dumps(session_data, default=str),
+                    'location_updated'
+                )
+                
+                # Show updated results
+                if 'ocr_result' in session_data:
+                    return await self.show_image_analysis_results(update, context, session_data)
+                else:
+                    return await self.show_manual_analysis_results(update, context, session_data)
+            
+            return LOCATION_INPUT
+            
+        except Exception as e:
+            self.logger.error(f"Error handling location input: {e}")
+            await update.message.reply_text("❌ Error processing location.")
+            return MAIN_MENU
+    
+    async def edit_complaint_details(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Allow user to edit complaint details"""
+        try:
+            query = update.callback_query
+            await query.answer()
+            
+            user_id = update.effective_user.id
+            
+            # Get session data
+            session = db_manager.get_session_data(user_id)
+            if not session:
+                await query.edit_message_text("❌ Session expired. Please start again.")
+                return MAIN_MENU
+            
+            session_data = json.loads(session.session_data)
+            
+            # Get current text
+            current_text = session_data.get('ocr_result', {}).get('cleaned_text', '')
+            if not current_text:
+                current_text = session_data.get('complaint_text', '')
+            
+            edit_message = (
+                "✏️ *Edit Complaint Details*\n\n"
+                f"*Current text:*\n{current_text[:300]}{'...' if len(current_text) > 300 else ''}\n\n"
+                "Please send the complete corrected complaint text.\n\n"
+                "Include all relevant details:\n"
+                "• What is the problem?\n"
+                "• Where is it located?\n"
+                "• When did it start?\n"
+                "• How serious is it?"
+            )
+            
+            keyboard = [[KeyboardButton("❌ Cancel Edit")]]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await query.edit_message_text(
+                edit_message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="Send your edited complaint text:",
+                reply_markup=reply_markup
+            )
+            
+            # Mark session as in edit mode
+            session_data['edit_mode'] = True
+            db_manager.create_or_update_session(
+                user_id,
+                json.dumps(session_data, default=str),
+                'editing_complaint'
+            )
+            
+            return MANUAL_COMPLAINT_INPUT
+            
+        except Exception as e:
+            self.logger.error(f"Error in edit_complaint_details: {e}")
+            await query.edit_message_text("❌ Error starting edit mode.")
+            return MAIN_MENU
+    
+    async def handle_manual_complaint_actions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle manual complaint action buttons"""
+        try:
+            query = update.callback_query
+            await query.answer()
+            
+            action = query.data
+            user_id = update.effective_user.id
+            
+            if action == "proceed_manual_complaint":
+                return await self.proceed_with_manual_complaint(update, context)
+            elif action == "add_manual_location":
+                return await self.request_location_input(update, context)
+            elif action == "edit_manual_complaint":
+                return await self.edit_complaint_details(update, context)
+            elif action == "cancel_complaint":
+                return await self.cancel_command(update, context)
+            else:
+                await query.edit_message_text("❌ Unknown action. Please try again.")
+                return MAIN_MENU
+                
+        except Exception as e:
+            self.logger.error(f"Error handling manual complaint actions: {e}")
+            return MAIN_MENU
+    
+    async def proceed_with_manual_complaint(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Proceed with manual complaint submission"""
+        try:
+            query = update.callback_query
+            user_id = update.effective_user.id
+            
+            # Get session data
+            session = db_manager.get_session_data(user_id)
+            if not session:
+                await query.edit_message_text("❌ Session expired. Please start again.")
+                return MAIN_MENU
+            
+            session_data = json.loads(session.session_data)
+            
+            # Prepare complaint for submission
+            formatted_complaint = complaint_classifier.format_for_submission(
+                session_data['complaint_text'],
+                session_data['classification'],
+                session_data['location_info']
+            )
+            
+            # Add user information
+            user = update.effective_user
+            formatted_complaint.update({
+                'citizen_name': f"{user.first_name or ''} {user.last_name or ''}".strip(),
+                'citizen_mobile': None,
+                'citizen_email': None
+            })
+            
+            # Add coordinates if available
+            coords = session_data['location_info'].get('final_coordinates')
+            if coords:
+                formatted_complaint['latitude'] = coords[0]
+                formatted_complaint['longitude'] = coords[1]
+            
+            # Show submission preview
+            preview_message = (
+                "📋 *Complaint Submission Preview*\n\n"
+                f"*Subject:* {formatted_complaint['subject']}\n\n"
+                f"*Category:* {formatted_complaint['category']}\n"
+                f"*Priority:* {formatted_complaint['priority']}\n"
+                f"*Department:* {formatted_complaint['department']}\n\n"
+                f"*Description:*\n{formatted_complaint['description'][:300]}{'...' if len(formatted_complaint['description']) > 300 else ''}\n\n"
+                "Click 'Submit' to send this complaint to the official government portal."
+            )
+            
+            buttons = [
+                [InlineKeyboardButton("🚀 Submit Complaint", callback_data="confirm_submission")],
+                [InlineKeyboardButton("✏️ Edit Details", callback_data="edit_manual_complaint")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_complaint")]
+            ]
+            reply_markup = InlineKeyboardMarkup(buttons)
+            
+            await query.edit_message_text(
+                preview_message,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup
+            )
+            
+            # Store formatted complaint in session
+            session_data['formatted_complaint'] = formatted_complaint
+            db_manager.create_or_update_session(
+                user_id,
+                json.dumps(session_data, default=str),
+                'ready_for_submission'
+            )
+            
+            return COMPLAINT_SUBMISSION
+            
+        except Exception as e:
+            self.logger.error(f"Error in proceed_with_manual_complaint: {e}")
+            await query.edit_message_text("❌ Error preparing complaint.")
+            return MAIN_MENU
+    
+    def cleanup_temp_images(self):
+        """Clean up old temporary images"""
+        try:
+            import time
+            current_time = time.time()
+            
+            if not os.path.exists(self.temp_dir):
+                return
+            
+            for filename in os.listdir(self.temp_dir):
+                file_path = os.path.join(self.temp_dir, filename)
+                
+                # Delete files older than 1 hour
+                if os.path.isfile(file_path):
+                    file_age = current_time - os.path.getmtime(file_path)
+                    if file_age > 3600:  # 1 hour in seconds
+                        os.remove(file_path)
+                        self.logger.info(f"Cleaned up old temp file: {filename}")
+        
+        except Exception as e:
+            self.logger.error(f"Error cleaning up temp images: {e}")
 
 # Initialize bot handler
 bot_handler = GrievanceBotHandler()
@@ -864,11 +1287,17 @@ def create_conversation_handler():
                 MessageHandler(filters.TEXT & filters.Regex("^❌ Cancel$"), bot_handler.cancel_command)
             ],
             COMPLAINT_REVIEW: [
-                CallbackQueryHandler(bot_handler.handle_complaint_actions)
+                CallbackQueryHandler(bot_handler.handle_complaint_actions),
+                CallbackQueryHandler(bot_handler.handle_manual_complaint_actions)
+            ],
+            LOCATION_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.handle_location_input),
+                MessageHandler(filters.LOCATION, bot_handler.handle_location_input)
             ],
             COMPLAINT_SUBMISSION: [
                 CallbackQueryHandler(bot_handler.confirm_submission, pattern="^confirm_submission$"),
-                CallbackQueryHandler(bot_handler.handle_complaint_actions)
+                CallbackQueryHandler(bot_handler.handle_complaint_actions),
+                CallbackQueryHandler(bot_handler.handle_manual_complaint_actions)
             ],
             TRACKING_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bot_handler.handle_tracking_input)
@@ -885,12 +1314,24 @@ def create_conversation_handler():
         allow_reentry=True
     )
 
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic cleanup job for temporary files"""
+    try:
+        bot_handler.cleanup_temp_images()
+        logger.info("Periodic cleanup completed")
+    except Exception as e:
+        logger.error(f"Error in cleanup job: {e}")
+
 def main():
     """Main function to start the bot"""
     try:
         # Validate configuration
         validate_config()
         logger.info("Configuration validated successfully")
+        
+        # Clean up old temp files on startup
+        bot_handler.cleanup_temp_images()
+        logger.info("Startup cleanup completed")
         
         # Create application
         application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
@@ -902,8 +1343,13 @@ def main():
         # Add command handlers that should work outside conversation
         application.add_handler(CommandHandler("help", bot_handler.help_command))
         
+        # Schedule periodic cleanup (every hour)
+        job_queue = application.job_queue
+        job_queue.run_repeating(cleanup_job, interval=3600, first=3600)
+        
         # Start the bot
         logger.info("Starting Grievance Redressal Bot...")
+        logger.info("Bot is ready to receive messages!")
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True
