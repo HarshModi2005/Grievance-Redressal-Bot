@@ -20,6 +20,7 @@ from telegram.constants import ParseMode
 from config import Config, validate_config
 from database import db_manager
 from ocr_processor import ocr_processor
+from ai_image_analyzer import ai_image_analyzer
 from location_detector import location_detector
 from complaint_classifier import complaint_classifier
 from umang_client import umang_client
@@ -221,14 +222,17 @@ class GrievanceBotHandler:
             db_manager.clear_session(user_id)
             
             instructions = (
-                "📸 *Image-Based Complaint Submission*\n\n"
+                "📸 *AI-Powered Image Analysis*\n\n"
                 "Please send a clear photo of the issue you want to report.\n\n"
+                "🤖 *AI will analyze:*\n"
+                "• What problem is visible in the image\n"
+                "• Severity and category of the issue\n"
+                "• Relevant details and location clues\n"
+                "• Appropriate department to handle it\n\n"
                 "📋 *Tips for better results:*\n"
                 "• Take photo in good lighting\n"
-                "• Include any text or signboards\n"
-                "• Show the problem clearly\n"
-                "• Enable location services for GPS data\n\n"
-                "I'll analyze the image to extract text and detect location automatically."
+                "• Show the problem clearly (e.g., potholes, garbage, broken infrastructure)\n"
+                "• Enable location services for GPS data"
             )
             
             keyboard = [[KeyboardButton("❌ Cancel")]]
@@ -261,10 +265,10 @@ class GrievanceBotHandler:
             
             # Show processing message
             processing_msg = await update.message.reply_text(
-                "⏳ Processing your image...\n"
-                "🔍 Extracting text\n"
+                "⏳ Processing your image with AI...\n"
+                "🤖 Analyzing image content\n"
                 "📍 Detecting location\n"
-                "🏷️ Classifying complaint type"
+                "🏷️ Identifying issues and severity"
             )
             
             # Get the largest photo
@@ -284,34 +288,37 @@ class GrievanceBotHandler:
                 )
                 return WAITING_FOR_IMAGE
             
-            # Process image with OCR
-            ocr_result = ocr_processor.extract_text_from_image(image_path)
+            # Process image with AI
+            ai_analysis = ai_image_analyzer.analyze_grievance_image(image_path)
             
-            # Check if OCR was successful
-            if not ocr_result.get('extraction_success') and not ocr_result.get('cleaned_text'):
-                self.logger.warning(f"OCR failed or no text found in image for user {user_id}")
+            # Check if AI analysis was successful
+            if not ai_analysis.get('success'):
+                self.logger.warning(f"AI analysis failed for user {user_id}: {ai_analysis.get('error', 'Unknown error')}")
                 if processing_msg:
                     await processing_msg.delete()
                 await update.message.reply_text(
-                    "⚠️ Could not extract readable text from the image.\n\n"
+                    "⚠️ Could not analyze the image.\n\n"
                     "You can:\n"
                     "• Try with a clearer, well-lit photo\n"
-                    "• Use Manual Complaint Entry to type your complaint\n"
-                    "• Continue anyway (less accurate classification)"
+                    "• Use Manual Complaint Entry to type your complaint"
                 )
-                # Continue processing even with poor OCR
+                return WAITING_FOR_IMAGE
             
-            # Extract GPS coordinates
+            # Extract GPS coordinates from image metadata
             gps_coords = ocr_processor.extract_gps_from_image(image_path)
             
-            # Detect location from text
-            text_location = location_detector.detect_location_from_text(ocr_result.get('cleaned_text', ''))
+            # Detect location from AI-extracted clues or description
+            location_text = ' '.join(ai_analysis.get('location_clues', [])) or ai_analysis.get('description', '')
+            text_location = location_detector.detect_location_from_text(location_text)
             
-            # Classify complaint
-            classification = complaint_classifier.classify_complaint(
-                ocr_result.get('cleaned_text', ''),
-                {'location': text_location, 'gps': gps_coords}
-            )
+            # Use AI classification instead of keyword-based
+            classification = {
+                'primary_category': ai_analysis.get('category', 'other'),
+                'confidence_score': 85.0,  # AI-based confidence
+                'priority_level': ai_analysis.get('severity', 'medium'),
+                'suggested_department': ai_analysis.get('suggested_department', 'General'),
+                'keywords': ai_analysis.get('key_issues', [])
+            }
             
             # Combine location methods
             location_info = location_detector.combine_location_methods(
@@ -321,7 +328,7 @@ class GrievanceBotHandler:
             # Store session data
             session_data = {
                 'image_path': image_path,
-                'ocr_result': ocr_result,
+                'ai_analysis': ai_analysis,
                 'gps_coords': gps_coords,
                 'text_location': text_location,
                 'classification': classification,
@@ -364,25 +371,30 @@ class GrievanceBotHandler:
     async def show_image_analysis_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE, session_data: Dict) -> int:
         """Show image analysis results to user"""
         try:
-            ocr_result = session_data['ocr_result']
+            ai_analysis = session_data['ai_analysis']
             classification = session_data['classification']
             location_info = session_data['location_info']
             
             # Build result message
-            result_message = "🔍 *Image Analysis Complete*\n\n"
+            result_message = "🤖 *AI Image Analysis Complete*\n\n"
             
-            # OCR Results
-            if ocr_result.get('extraction_success'):
-                result_message += f"📝 *Extracted Text:*\n{ocr_result['cleaned_text'][:200]}{'...' if len(ocr_result['cleaned_text']) > 200 else ''}\n\n"
-                result_message += f"🎯 *OCR Confidence:* {ocr_result['confidence']:.1f}%\n\n"
-            else:
-                result_message += "📝 *Text Extraction:* No readable text found\n\n"
+            # AI Analysis Results
+            if ai_analysis.get('description'):
+                description = ai_analysis['description']
+                result_message += f"📝 *What AI Detected:*\n{description[:300]}{'...' if len(description) > 300 else ''}\n\n"
+            
+            # Key Issues
+            if ai_analysis.get('key_issues'):
+                result_message += "🔍 *Key Issues Identified:*\n"
+                for issue in ai_analysis['key_issues'][:3]:
+                    result_message += f"• {issue}\n"
+                result_message += "\n"
             
             # Classification Results
             category = classification['primary_category'].replace('_', ' ').title()
-            result_message += f"🏷️ *Complaint Category:* {category}\n"
-            result_message += f"📊 *Classification Confidence:* {classification['confidence_score']:.1f}%\n"
-            result_message += f"⚡ *Priority Level:* {classification['priority_level'].title()}\n\n"
+            result_message += f"🏷️ *Category:* {category}\n"
+            result_message += f"⚡ *Severity:* {classification['priority_level'].title()}\n"
+            result_message += f"🏛️ *Department:* {classification['suggested_department']}\n\n"
             
             # Location Results
             if location_info.get('final_address'):
@@ -393,8 +405,10 @@ class GrievanceBotHandler:
                 result_message += "📍 *Location:* Could not detect automatically\n\n"
             
             # Suggested improvements
+            # Use AI description as the complaint text
+            complaint_text = ai_analysis.get('description', '')
             suggestions = complaint_classifier.suggest_improvements(
-                ocr_result.get('cleaned_text', ''),
+                complaint_text,
                 classification
             )
             
@@ -475,8 +489,13 @@ class GrievanceBotHandler:
             session_data = json.loads(session.session_data)
             
             # Prepare complaint for submission
+            # Get complaint text from AI analysis or manual entry
+            complaint_text = session_data.get('ai_analysis', {}).get('description', '')
+            if not complaint_text:
+                complaint_text = session_data.get('complaint_text', '')
+            
             formatted_complaint = complaint_classifier.format_for_submission(
-                session_data['ocr_result'].get('cleaned_text', ''),
+                complaint_text,
                 session_data['classification'],
                 session_data['location_info']
             )
@@ -592,8 +611,8 @@ class GrievanceBotHandler:
                 try:
                     # Get complaint text from appropriate source
                     complaint_text = ''
-                    if 'ocr_result' in session_data:
-                        complaint_text = session_data['ocr_result'].get('cleaned_text', '')
+                    if 'ai_analysis' in session_data:
+                        complaint_text = session_data['ai_analysis'].get('description', '')
                     elif 'complaint_text' in session_data:
                         complaint_text = session_data['complaint_text']
                     
@@ -874,7 +893,12 @@ class GrievanceBotHandler:
             # Preserve image path if it exists (for edited image-based complaints)
             if is_edit_mode and 'image_path' in existing_session_data:
                 session_data['image_path'] = existing_session_data['image_path']
-                session_data['ocr_result'] = {'cleaned_text': text}
+                # Update AI analysis with edited text
+                if 'ai_analysis' in existing_session_data:
+                    session_data['ai_analysis'] = existing_session_data['ai_analysis']
+                    session_data['ai_analysis']['description'] = text
+                else:
+                    session_data['ai_analysis'] = {'description': text}
             
             db_manager.create_or_update_session(
                 user_id,
@@ -1038,7 +1062,7 @@ class GrievanceBotHandler:
                     )
                     
                     # Show updated results
-                    if 'ocr_result' in session_data:
+                    if 'ai_analysis' in session_data:
                         return await self.show_image_analysis_results(update, context, session_data)
                     else:
                         return await self.show_manual_analysis_results(update, context, session_data)
@@ -1073,7 +1097,7 @@ class GrievanceBotHandler:
                 )
                 
                 # Show updated results
-                if 'ocr_result' in session_data:
+                if 'ai_analysis' in session_data:
                     return await self.show_image_analysis_results(update, context, session_data)
                 else:
                     return await self.show_manual_analysis_results(update, context, session_data)
@@ -1102,7 +1126,7 @@ class GrievanceBotHandler:
             session_data = json.loads(session.session_data)
             
             # Get current text
-            current_text = session_data.get('ocr_result', {}).get('cleaned_text', '')
+            current_text = session_data.get('ai_analysis', {}).get('description', '')
             if not current_text:
                 current_text = session_data.get('complaint_text', '')
             
