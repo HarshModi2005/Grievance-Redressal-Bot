@@ -18,6 +18,17 @@ class Config:
     UMANG_CLIENT_SECRET = os.getenv('UMANG_CLIENT_SECRET')
     UMANG_API_BASE_URL = os.getenv('UMANG_API_BASE_URL', 'https://api.umang.gov.in')
     
+    # CPGRAMS API Configuration
+    CPGRAMS_API_BASE_URL = os.getenv('CPGRAMS_API_BASE_URL', 'https://api.cpgrams.gov.in')
+    CPGRAMS_CLIENT_ID = os.getenv('CPGRAMS_CLIENT_ID')
+    CPGRAMS_CLIENT_SECRET = os.getenv('CPGRAMS_CLIENT_SECRET')
+    CPGRAMS_API_VERSION = os.getenv('CPGRAMS_API_VERSION', 'v2')
+    
+    # Department Identification Configuration
+    ENABLE_DEPARTMENT_ROUTING = os.getenv('ENABLE_DEPARTMENT_ROUTING', 'true').lower() == 'true'
+    DEPARTMENT_CONFIDENCE_THRESHOLD = float(os.getenv('DEPARTMENT_CONFIDENCE_THRESHOLD', '60.0'))
+    FALLBACK_DEPARTMENT = os.getenv('FALLBACK_DEPARTMENT', 'GENERAL')
+    
     # OCR Configuration
     TESSERACT_CMD = os.getenv('TESSERACT_CMD', '/usr/bin/tesseract')
     
